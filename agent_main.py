@@ -1005,13 +1005,43 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Greeting runs ONLY in cascade task
     if job_task == "cascade":
-        await asyncio.sleep(1.5)
-        asyncio.create_task(
-            locked_process_turn(
-                b"",
-                preset_text="你好，我已经进入语音房间，请用一句话向我打招呼。",
+        await asyncio.sleep(1.2)
+        greeting_text = (job_meta.get("greeting_text") or "").strip()
+        if greeting_text:
+            async def _speak_persona_greeting():
+                async with speaking_lock:
+                    tid = f"greet_{uuid.uuid4().hex[:8]}"
+                    await publish_packet(
+                        {
+                            "type": "subtitle",
+                            "role": "assistant",
+                            "text": greeting_text,
+                            "turn_id": tid,
+                            "final": True,
+                            "ts": int(time.time() * 1000),
+                        }
+                    )
+                    try:
+                        rt = await driver.target_state()
+                        tts_b = rt.get("tts") or tts
+                    except Exception:
+                        tts_b = tts
+                    pcm_out, out_sr, tts_dur_ms = await synthesize(tts_b, greeting_text)
+                    await report_metering(
+                        "tts",
+                        tts_b.get("model") or "tts",
+                        {"tts_characters": len(greeting_text), "audio_duration_ms": tts_dur_ms},
+                    )
+                    await push_audio(pcm_out, out_sr)
+
+            asyncio.create_task(_speak_persona_greeting())
+        else:
+            asyncio.create_task(
+                locked_process_turn(
+                    b"",
+                    preset_text="你好，我已经进入语音房间，请用一句话向我打招呼。",
+                )
             )
-        )
 
 
 if __name__ == "__main__":
