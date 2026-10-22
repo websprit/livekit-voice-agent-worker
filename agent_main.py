@@ -520,7 +520,7 @@ async def call_llm_strict(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        "max_tokens": 512,
+        "max_tokens": 2048,
         "temperature": 0.0,
     }
     try:
@@ -558,7 +558,7 @@ async def call_llm_stream_strict(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        "max_tokens": 512,
+        "max_tokens": 2048,
         "temperature": 0.0,
         "stream": True,
         "stream_options": {"include_usage": True},
