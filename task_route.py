@@ -595,7 +595,14 @@ class TaskSessionDriver:
         else:
             if self.transcribe_cascade_fn is None:
                 return
-            user_text, stt_dur_ms = await self.transcribe_cascade_fn(stt, pcm)
+            try:
+                user_text, stt_dur_ms = await self.transcribe_cascade_fn(stt, pcm)
+            except Exception as exc:
+                await self.publish_error("stt_failed", str(exc))
+                return
+            if not (user_text or "").strip():
+                await self.publish_error("stt_failed", "empty transcription")
+                return
 
         await self.publish_packet(
             {

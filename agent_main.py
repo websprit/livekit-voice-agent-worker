@@ -99,7 +99,9 @@ def load_vendor_plugins():
     import sys
 
     here = Path(__file__).resolve().parent
+    env_root = os.environ.get("LIVEKIT_PLUGINS_ROOT", "").strip()
     candidates = [
+        Path(env_root) if env_root else None,
         here.parents[1] / "livekit-agents" / "livekit-plugins" if len(here.parents) > 1 else None,
         here.parents[2] / "livekit-plugins" if len(here.parents) > 2 else None,
     ]
@@ -176,15 +178,9 @@ def run_local_stt_strict(
 
 
 def run_local_stt(pcm_bytes: bytes, sample_rate: int = 16000, model_dir: str = "") -> tuple[str, int]:
-    """Cascade-only wrapper with fallback conversational prompt."""
-    duration_ms = max(100, int(len(pcm_bytes) / (sample_rate * 2) * 1000))
-    try:
-        text, dur_ms, _ = run_local_stt_strict(pcm_bytes, sample_rate, model_dir, language=None)
-        if text:
-            return text, dur_ms
-    except Exception as exc:
-        log.warning("Faster-Whisper transcribe exception: %s", exc)
-    return "你好，请介绍一下你自己，并告诉我今天的状态。", duration_ms
+    """Cascade transcription. Recognition failures propagate to the caller."""
+    text, dur_ms, _ = run_local_stt_strict(pcm_bytes, sample_rate, model_dir, language=None)
+    return text, dur_ms
 
 
 async def transcribe_openai(
@@ -210,14 +206,24 @@ async def transcribe_openai(
 async def transcribe_strict(
     binding: dict, pcm_bytes: bytes, language: str | None = None
 ) -> tuple[str, int, str]:
-    load_vendor_plugins()
-    from livekit.plugins.google import audio_builders as google_audio
-    import vendor_dispatch
-
     protocol = binding.get("protocol") or "whisper_local"
     duration_ms = max(100, int(len(pcm_bytes) / 32))
     api_key = (binding.get("api_key") or "").strip()
+    if protocol == "whisper_local":
+        return await asyncio.to_thread(
+            run_local_stt_strict,
+            pcm_bytes,
+            16000,
+            binding.get("voice") or binding.get("model") or "",
+            language,
+        )
+
+    load_vendor_plugins()
+    import vendor_dispatch
+
     if protocol == "google_stt":
+        from livekit.plugins.google import audio_builders as google_audio
+
         request = vendor_dispatch.transcription_request(binding, pcm_bytes)
         if api_key.startswith("mock_") or api_key.startswith("demo_"):
             return await asyncio.to_thread(
@@ -228,11 +234,37 @@ async def transcribe_strict(
         if not text:
             raise SttFailedError("google_stt returned empty text")
         return text, duration_ms, language or ""
-    if protocol in ("dashscope_stt", "volcengine_stt"):
+    if protocol == "dashscope_stt":
+        if not api_key:
+            raise SttFailedError("dashscope_stt is missing api_key")
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(
+                run_local_stt_strict, pcm_bytes, 16000, WHISPER_MODEL_DIR, language
+            )
+        load_vendor_plugins()
+        from livekit.plugins.dashscope.audio import transcribe_pcm
+
+        text = (
+            await transcribe_pcm(
+                api_key,
+                binding.get("model") or "qwen-audio-3.1-asr-flash-streaming",
+                pcm_bytes,
+                url=binding.get("base_url") or "",
+                language=language or "zh",
+            )
+        ).strip()
+        if not text:
+            raise SttFailedError("dashscope_stt returned empty text")
+        log.info("dashscope_stt chars=%d duration_ms=%d", len(text), duration_ms)
+        return text, duration_ms, language or "zh"
+    if protocol == "volcengine_stt":
+        load_vendor_plugins()
+        import vendor_dispatch
+
         vendor_dispatch.transcription_request(binding, pcm_bytes)
         if not api_key:
             raise SttFailedError(
-                f"{protocol} request is built and covered by unit tests; live socket is not opened without vendor credentials"
+                "volcengine_stt request is built and covered by unit tests; live socket is not opened without vendor credentials"
             )
         return await asyncio.to_thread(
             run_local_stt_strict, pcm_bytes, 16000, WHISPER_MODEL_DIR, language
@@ -248,14 +280,6 @@ async def transcribe_strict(
         if not text:
             raise SttFailedError("openai_stt returned empty text")
         return text, dur, language or ""
-    if protocol == "whisper_local":
-        return await asyncio.to_thread(
-            run_local_stt_strict,
-            pcm_bytes,
-            16000,
-            binding.get("voice") or binding.get("model") or "",
-            language,
-        )
     raise SttFailedError(f"unsupported stt protocol: {protocol}")
 
 
@@ -351,16 +375,20 @@ async def synthesize_openai(binding: dict, text: str, inference: bool = False) -
 
 
 async def synthesize_strict(binding: dict, text: str) -> tuple[bytes, int, int]:
-    load_vendor_plugins()
-    import vendor_dispatch
-
     protocol = (binding.get("protocol") or "piper_local").strip()
     api_key = (binding.get("api_key") or "").strip()
     if protocol == "piper_local":
         return await asyncio.to_thread(
             run_local_tts_strict, text, 24000, binding.get("voice") or PIPER_MODEL_PATH
         )
-    if protocol in ("dashscope_tts", "volcengine_tts", "azure_tts", "google_tts") and api_key:
+    load_vendor_plugins()
+    import vendor_dispatch
+
+    if protocol == "dashscope_tts" and api_key:
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(run_local_tts_strict, text, 24000, PIPER_MODEL_PATH)
+        return await _synthesize_dashscope(binding, text)
+    if protocol in ("volcengine_tts", "azure_tts", "google_tts") and api_key:
         vendor_dispatch.synthesis_request(binding, text)
         return await asyncio.to_thread(run_local_tts_strict, text, 24000, PIPER_MODEL_PATH)
     if protocol == "openai_tts" and api_key:
@@ -382,15 +410,40 @@ async def synthesize_strict(binding: dict, text: str) -> tuple[bytes, int, int]:
     raise TtsProtocolUnsupportedError(f"unsupported or unconfigured tts protocol: {protocol}")
 
 
+async def _synthesize_dashscope(binding: dict, text: str) -> tuple[bytes, int, int]:
+    load_vendor_plugins()
+    from livekit.plugins.dashscope.audio import synthesize_speech
+
+    wav = await synthesize_speech(
+        (binding.get("api_key") or "").strip(),
+        binding.get("model") or "qwen-audio-3.1-tts-flash",
+        text,
+        url=binding.get("base_url") or "",
+        voice=binding.get("voice") or "longanhuan_v3.1",
+    )
+    with wave.open(io.BytesIO(wav), "rb") as wav_file:
+        pcm = wav_file.readframes(wav_file.getnframes())
+        sample_rate = wav_file.getframerate()
+    pcm = resample_pcm16(pcm, sample_rate, 24000)
+    duration_ms = max(100, int(len(pcm) / (24000 * 2) * 1000))
+    log.info("dashscope_tts ms=%d chars=%d", duration_ms, len(text))
+    return pcm, 24000, duration_ms
+
+
 async def synthesize(binding: dict, text: str) -> tuple[bytes, int, int]:
     """Cascade-only synthesis wrapper."""
-    load_vendor_plugins()
-    from livekit.plugins.google import audio_builders as google_audio
-    import vendor_dispatch
-
     protocol = binding.get("protocol") or "piper_local"
     api_key = (binding.get("api_key") or "").strip()
+    if protocol == "piper_local":
+        return await asyncio.to_thread(
+            run_local_tts, text, 24000, binding.get("voice") or PIPER_MODEL_PATH
+        )
+    load_vendor_plugins()
+    import vendor_dispatch
+
     if protocol == "google_tts":
+        from livekit.plugins.google import audio_builders as google_audio
+
         request = vendor_dispatch.synthesis_request(binding, text)
         if api_key.startswith("mock_") or api_key.startswith("demo_"):
             return await asyncio.to_thread(run_local_tts, text, 24000, PIPER_MODEL_PATH)
@@ -400,7 +453,13 @@ async def synthesize(binding: dict, text: str) -> tuple[bytes, int, int]:
         pcm, rate = google_audio.parse_gemini_tts_response(payload)
         pcm = resample_pcm16(pcm, rate, 24000)
         return pcm, 24000, max(100, int(len(pcm) / 48))
-    if protocol in ("dashscope_tts", "volcengine_tts", "azure_tts"):
+    if protocol == "dashscope_tts":
+        if not api_key:
+            raise RuntimeError("dashscope_tts is missing api_key")
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(run_local_tts, text, 24000, PIPER_MODEL_PATH)
+        return await _synthesize_dashscope(binding, text)
+    if protocol in ("volcengine_tts", "azure_tts"):
         vendor_dispatch.synthesis_request(binding, text)
         if not api_key:
             raise RuntimeError(
@@ -411,10 +470,6 @@ async def synthesize(binding: dict, text: str) -> tuple[bytes, int, int]:
         if api_key.startswith("mock_") or api_key.startswith("demo_"):
             return await asyncio.to_thread(run_local_tts, text, 24000, PIPER_MODEL_PATH)
         return await synthesize_openai(binding, text, inference=protocol == "livekit_inference")
-    if protocol == "piper_local":
-        return await asyncio.to_thread(
-            run_local_tts, text, 24000, binding.get("voice") or PIPER_MODEL_PATH
-        )
     raise RuntimeError(f"unsupported tts protocol: {protocol}")
 
 

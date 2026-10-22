@@ -223,6 +223,34 @@ class TestTaskRoute(unittest.IsolatedAsyncioTestCase):
         await cas_driver.process_turn(b"\x01\x02" * 4000)
         self.assertEqual(cas_steps, ["stt", "llm", "tts"])
 
+        fail_packets = []
+
+        async def failing_stt(binding, pcm):
+            raise RuntimeError("Faster-Whisper failed")
+
+        fail_driver = TaskSessionDriver(
+            session_id="sess_stt_fail",
+            room_name="rm",
+            tenant_id="t1",
+            api_key_id="ak1",
+            job_task="cascade",
+            embedded_runtime={
+                "task": "cascade",
+                "stt": {"model": "w"},
+                "llm": {"model": "l"},
+                "tts": {"model": "p"},
+            },
+            fail_closed=False,
+            get_runtime_fn=failing_rt,
+            transcribe_cascade_fn=failing_stt,
+            call_llm_cascade_fn=self._step_fn(cas_steps, "llm", ("不应调用", {})),
+            synthesize_cascade_fn=self._step_fn(cas_steps, "tts", (b"\x00\x00", 24000, 200)),
+            publish_packet_fn=lambda packet: self._record(fail_packets, packet),
+        )
+        await fail_driver.process_turn(b"\x01\x02" * 4000)
+        self.assertEqual(cas_steps, ["stt", "llm", "tts"])
+        self.assertTrue(any(p.get("code") == "stt_failed" for p in fail_packets))
+
         # 2. Transcribe uses embedded STT (and never reads target_lang) when cache is empty,
         # and uses newer cached source_lang when cache was populated by start_turn
         tr_langs = []

@@ -1,9 +1,5 @@
 """Select a vendor request from a HiMarket model binding. Transport stays outside."""
 
-from livekit.plugins.google import audio_builders as google_audio
-from livekit.plugins.dashscope import audio as dashscope_audio
-from livekit.plugins.volcengine import audio as volcengine_audio
-
 OPENAI_COMPATIBLE = {"openai_chat", "openai_stt", "openai_tts", "openai_realtime"}
 DIRECT = OPENAI_COMPATIBLE | {"azure_tts", "google_stt", "google_tts", "google_realtime", "dashscope_stt", "dashscope_tts", "dashscope_realtime", "volcengine_stt", "volcengine_tts", "volcengine_realtime", "whisper_local", "piper_local", "livekit_inference", "livekit_realtime"}
 
@@ -19,9 +15,28 @@ def require_protocol(binding: dict) -> str:
     return protocol
 
 
+def _google_audio():
+    from livekit.plugins.google import audio_builders as google_audio
+
+    return google_audio
+
+
+def _dashscope_audio():
+    from livekit.plugins.dashscope import audio as dashscope_audio
+
+    return dashscope_audio
+
+
+def _volcengine_audio():
+    from livekit.plugins.volcengine import audio as volcengine_audio
+
+    return volcengine_audio
+
+
 def transcription_request(binding: dict, pcm: bytes) -> dict:
     protocol = require_protocol(binding)
     if protocol == "google_stt":
+        google_audio = _google_audio()
         location = binding.get("voice") or "global"
         return {
             "url": google_audio.chirp3_recognize_url(binding.get("api_secret") or "", location),
@@ -29,9 +44,11 @@ def transcription_request(binding: dict, pcm: bytes) -> dict:
             "headers": {"x-goog-api-key": binding.get("api_key") or ""},
         }
     if protocol == "dashscope_stt":
+        dashscope_audio = _dashscope_audio()
         task = dashscope_audio.asr_run_task(binding.get("model") or "")
         return {"messages": [task, dashscope_audio.asr_audio_frame(task["header"]["task_id"], pcm)]}
     if protocol == "volcengine_stt":
+        volcengine_audio = _volcengine_audio()
         return {
             "frames": [
                 volcengine_audio.sauc_start(binding.get("api_secret") or "", binding.get("api_key") or "", binding.get("model") or ""),
@@ -46,6 +63,7 @@ def transcription_request(binding: dict, pcm: bytes) -> dict:
 def synthesis_request(binding: dict, text: str) -> dict:
     protocol = require_protocol(binding)
     if protocol == "google_tts":
+        google_audio = _google_audio()
         model = binding.get("model") or ""
         if not google_audio.is_gemini_tts(model):
             raise UnsupportedProtocol("google cloud tts voice path is unchanged")
@@ -54,8 +72,10 @@ def synthesis_request(binding: dict, text: str) -> dict:
             "json": google_audio.gemini_tts_request(text, voice=binding.get("voice") or ""),
         }
     if protocol == "dashscope_tts":
+        dashscope_audio = _dashscope_audio()
         return {"json": dashscope_audio.tts_request(binding.get("model") or "", text, voice=binding.get("voice") or "")}
     if protocol == "volcengine_tts":
+        volcengine_audio = _volcengine_audio()
         return {"json": volcengine_audio.tts_request(binding.get("api_secret") or "", binding.get("api_key") or "", binding.get("model") or "", text, voice=binding.get("voice") or "")}
     if protocol == "azure_tts":
         return {"voice": binding.get("voice") or "", "region_url": binding.get("base_url") or ""}
@@ -68,9 +88,9 @@ def realtime_session(binding: dict) -> dict:
     protocol = require_protocol(binding)
     model = binding.get("model") or ""
     if protocol == "dashscope_realtime":
-        return dashscope_audio.realtime_session(model)
+        return _dashscope_audio().realtime_session(model)
     if protocol == "volcengine_realtime":
-        return volcengine_audio.realtime_start(model)
+        return _volcengine_audio().realtime_start(model)
     if protocol in {"openai_realtime", "google_realtime", "livekit_realtime"}:
         return {"model": model, "url": binding.get("base_url") or ""}
     raise UnsupportedProtocol(protocol)
