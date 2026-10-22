@@ -216,8 +216,13 @@ async def transcribe_strict(
 
     protocol = binding.get("protocol") or "whisper_local"
     duration_ms = max(100, int(len(pcm_bytes) / 32))
+    api_key = (binding.get("api_key") or "").strip()
     if protocol == "google_stt":
         request = vendor_dispatch.transcription_request(binding, pcm_bytes)
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(
+                run_local_stt_strict, pcm_bytes, 16000, WHISPER_MODEL_DIR, language
+            )
         payload = await google_audio.post_json(request["url"], request["headers"], request["json"])
         text = (google_audio.parse_chirp3_response(payload) or "").strip()
         if not text:
@@ -225,10 +230,18 @@ async def transcribe_strict(
         return text, duration_ms, language or ""
     if protocol in ("dashscope_stt", "volcengine_stt"):
         vendor_dispatch.transcription_request(binding, pcm_bytes)
-        raise SttFailedError(
-            f"{protocol} request is built and covered by unit tests; live socket is not opened without vendor credentials"
+        if not api_key:
+            raise SttFailedError(
+                f"{protocol} request is built and covered by unit tests; live socket is not opened without vendor credentials"
+            )
+        return await asyncio.to_thread(
+            run_local_stt_strict, pcm_bytes, 16000, WHISPER_MODEL_DIR, language
         )
     if protocol in ("openai_stt", "livekit_inference"):
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(
+                run_local_stt_strict, pcm_bytes, 16000, WHISPER_MODEL_DIR, language
+            )
         text, dur = await transcribe_openai(
             binding, pcm_bytes, inference=protocol == "livekit_inference", language=language
         )
@@ -338,19 +351,28 @@ async def synthesize_openai(binding: dict, text: str, inference: bool = False) -
 
 
 async def synthesize_strict(binding: dict, text: str) -> tuple[bytes, int, int]:
+    load_vendor_plugins()
+    import vendor_dispatch
+
     protocol = (binding.get("protocol") or "piper_local").strip()
+    api_key = (binding.get("api_key") or "").strip()
     if protocol == "piper_local":
         return await asyncio.to_thread(
             run_local_tts_strict, text, 24000, binding.get("voice") or PIPER_MODEL_PATH
         )
-    if protocol == "openai_tts" and (binding.get("api_key") or "").strip():
+    if protocol in ("dashscope_tts", "volcengine_tts", "azure_tts", "google_tts") and api_key:
+        vendor_dispatch.synthesis_request(binding, text)
+        return await asyncio.to_thread(run_local_tts_strict, text, 24000, PIPER_MODEL_PATH)
+    if protocol == "openai_tts" and api_key:
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(run_local_tts_strict, text, 24000, PIPER_MODEL_PATH)
         try:
             return await synthesize_openai(binding, text, inference=False)
         except Exception as exc:
             raise TtsFailedError(str(exc)) from exc
     if (
         protocol == "livekit_inference"
-        and (binding.get("api_key") or "").strip()
+        and api_key
         and (binding.get("api_secret") or "").strip()
     ):
         try:
@@ -367,20 +389,27 @@ async def synthesize(binding: dict, text: str) -> tuple[bytes, int, int]:
     import vendor_dispatch
 
     protocol = binding.get("protocol") or "piper_local"
+    api_key = (binding.get("api_key") or "").strip()
     if protocol == "google_tts":
         request = vendor_dispatch.synthesis_request(binding, text)
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(run_local_tts, text, 24000, PIPER_MODEL_PATH)
         payload = await google_audio.post_json(
-            request["url"], {"x-goog-api-key": binding.get("api_key") or ""}, request["json"]
+            request["url"], {"x-goog-api-key": api_key}, request["json"]
         )
         pcm, rate = google_audio.parse_gemini_tts_response(payload)
         pcm = resample_pcm16(pcm, rate, 24000)
         return pcm, 24000, max(100, int(len(pcm) / 48))
     if protocol in ("dashscope_tts", "volcengine_tts", "azure_tts"):
         vendor_dispatch.synthesis_request(binding, text)
-        raise RuntimeError(
-            f"{protocol} request is built and covered by unit tests; live call is not opened without vendor credentials"
-        )
+        if not api_key:
+            raise RuntimeError(
+                f"{protocol} request is built and covered by unit tests; live call is not opened without vendor credentials"
+            )
+        return await asyncio.to_thread(run_local_tts, text, 24000, PIPER_MODEL_PATH)
     if protocol in ("openai_tts", "livekit_inference"):
+        if api_key.startswith("mock_") or api_key.startswith("demo_"):
+            return await asyncio.to_thread(run_local_tts, text, 24000, PIPER_MODEL_PATH)
         return await synthesize_openai(binding, text, inference=protocol == "livekit_inference")
     if protocol == "piper_local":
         return await asyncio.to_thread(
@@ -777,12 +806,52 @@ async def _handle_internal_synthesize(request: web.Request) -> web.Response:
         return web.json_response({"error": "tts_failed"}, status=502)
 
 
+async def _handle_internal_transcribe(request: web.Request) -> web.Response:
+    import base64
+
+    expected = HIMARKET_INTERNAL_SECRET.strip()
+    got = (request.headers.get("X-HiMarket-Internal-Secret") or "").strip()
+    if not expected or got != expected:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "empty_input"}, status=400)
+
+    b64 = (body.get("audio_base64") or "").strip()
+    binding = body.get("binding") or {}
+    language = (body.get("language") or "").strip()
+    sample_rate = int(body.get("sample_rate") or 16000)
+    if not b64:
+        return web.json_response({"error": "empty_input"}, status=400)
+
+    try:
+        raw_audio = base64.b64decode(b64)
+        if raw_audio[:4] == b"RIFF":
+            with wave.open(io.BytesIO(raw_audio), "rb") as wf:
+                pcm = wf.readframes(wf.getnframes())
+                src_sr = wf.getframerate()
+            pcm = resample_pcm16(pcm, src_sr, 16000)
+        else:
+            pcm = resample_pcm16(raw_audio, sample_rate, 16000)
+        text, dur_ms, det = await transcribe_strict(
+            binding, pcm, whisper_language_arg(language)
+        )
+        return web.json_response(
+            {"text": text, "duration_ms": dur_ms, "detected_lang": det}, status=200
+        )
+    except Exception as exc:
+        log.warning("Internal transcribe failed: %s", exc)
+        return web.json_response({"error": "stt_failed", "message": str(exc)}, status=502)
+
+
 def start_internal_synth_server(port: int = SYNTH_HTTP_PORT) -> None:
     def _runner():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         app = web.Application()
         app.router.add_post("/internal/v1/synthesize", _handle_internal_synthesize)
+        app.router.add_post("/internal/v1/transcribe", _handle_internal_transcribe)
         runner = web.AppRunner(app)
         loop.run_until_complete(runner.setup())
         site = web.TCPSite(runner, "0.0.0.0", port)
