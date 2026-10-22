@@ -476,11 +476,13 @@ def _build_llm_headers_and_url(
     protocol = (binding.get("protocol") or "openai_chat").strip()
     if protocol not in ("openai_chat", "livekit_inference"):
         raise LlmFailedError(f"llm_protocol_unsupported: {protocol}")
-    base_url = (binding.get("base_url") or CLIPROXY_BASE_URL).rstrip("/")
     if protocol == "livekit_inference":
+        base_url = (binding.get("base_url") or CLIPROXY_BASE_URL).rstrip("/")
         api_key = inference_token(binding)
     else:
-        api_key = binding.get("api_key") or CLIPROXY_API_KEY
+        # All openai_chat text LLM requests route through CLIProxyAPI when CLIPROXY_BASE_URL is configured
+        base_url = (CLIPROXY_BASE_URL or binding.get("base_url") or "").rstrip("/")
+        api_key = CLIPROXY_API_KEY if CLIPROXY_BASE_URL else (binding.get("api_key") or CLIPROXY_API_KEY)
     llm_model = binding.get("model") or DEFAULT_LLM_MODEL
     url = f"{base_url}/chat/completions"
     headers = {
@@ -490,6 +492,7 @@ def _build_llm_headers_and_url(
         "X-HiMarket-Session-Id": session_id,
         "X-HiMarket-Tenant-Id": tenant_id,
         "X-HiMarket-Api-Key-Id": api_key_id,
+        "X-HiMarket-Upstream-Base-Url": (binding.get("base_url") or "").strip(),
     }
     return url, headers, llm_model
 
@@ -892,6 +895,7 @@ async def entrypoint(ctx: agents.JobContext):
     session_id = job_meta.get("session_id") or ctx.room.name
     tenant_id = job_meta.get("tenant_id") or "tenant_ugreen_01"
     api_key_id = job_meta.get("api_key_id") or "ak_live_ugreen_01"
+    voice_mode = (job_meta.get("mode") or "cascade").strip()
     job_task = (job_meta.get("task") or "cascade").strip()
     source_lang = (job_meta.get("source_lang") or "").strip()
     target_lang = (job_meta.get("target_lang") or "").strip()
@@ -976,6 +980,7 @@ async def entrypoint(ctx: agents.JobContext):
         "session_id": session_id,
         "tenant_id": tenant_id,
         "api_key_id": api_key_id,
+        "mode": voice_mode,
         "task": job_task,
         "source_lang": source_lang,
         "target_lang": target_lang,
